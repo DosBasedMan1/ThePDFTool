@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF & Image Combiner – Offline, In‑Browser</title>
+  <!--
+    Author: Charl Coetzer
+    License: Free to use, based on open-source pdf-lib library (https://github.com/Hopding/pdf-lib)
+    This tool is not an original proprietary development; it leverages open-source software under its respective license.
+  -->
+  <style>
+    :root{--bg:#0b1020;--card:#121a33;--text:#e7ecff;--muted:#98a3c7;--accent:#7aa2ff;--danger:#ff6b6b}
+    html,body{height:100%}
+    body{margin:0;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Noto Sans",sans-serif;background:linear-gradient(180deg,#0b1020,#0b132b);color:var(--text)}
+    .wrap{max-width:900px;margin:40px auto;padding:24px}
+    .card{background:var(--card);border:1px solid #1c2a52;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);padding:20px}
+    h1{font-size:28px;margin:0 0 8px}
+    p{color:var(--muted);margin-top:0}
+    .dropzone{border:2px dashed #3551a3;border-radius:14px;padding:24px;text-align:center;transition:.2s;background:rgba(122,162,255,.05)}
+    .dropzone.drag{background:rgba(122,162,255,.12);border-color:var(--accent)}
+    .btn{appearance:none;border:1px solid #2a3d7a;border-radius:12px;padding:10px 14px;background:#15234a;color:var(--text);cursor:pointer;display:inline-flex;gap:8px;align-items:center;font-weight:600}
+    .btn:hover{filter:brightness(1.1)}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .btn-danger{background:#3a1520;border-color:#77253b}
+    .list{margin:16px 0 0;list-style:none;padding:0;max-height:300px;overflow:auto}
+    .row{display:flex;gap:12px;align-items:center;justify-content:space-between;background:#0e1836;border:1px solid #22366b;padding:10px 12px;border-radius:10px;margin:10px 0}
+    .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .meta{font-size:12px;color:var(--muted)}
+    .footer{display:flex;gap:12px;justify-content:space-between;align-items:center;margin-top:16px;flex-wrap:wrap}
+    .tip{font-size:13px;color:var(--muted)}
+    .controls{display:flex;gap:6px}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>PDF & Image Combiner (client‑side)</h1>
+      <p>No installs. Drop your <strong>PDFs</strong> or <strong>JPG/PNG images</strong>, reorder items, and click <strong>Combine</strong>. You can also import PDFs as individual pages to rearrange pages within a document. Everything happens locally in your browser.</p>
+
+      <div id="drop" class="dropzone" tabindex="0" role="button" aria-label="Drop PDFs or images here or click to choose">
+        <div style="margin-bottom:10px">Drop PDFs or images here or</div>
+        <button class="btn" id="pickerBtn">Choose files</button>
+        <input id="picker" class="hidden" type="file" accept="application/pdf,image/jpeg,image/png" multiple>
+      </div>
+
+      <ul id="list" class="list" aria-live="polite"></ul>
+
+      <div class="footer">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" id="clearBtn">Clear</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label class="tip"><input type="checkbox" id="bookmarkCh" checked> Add bookmarks (per PDF)</label>
+          <label class="tip"><input type="checkbox" id="expandPdfCh" checked> Import PDFs as pages</label>
+          <label class="tip"><input type="checkbox" id="fitA4Ch"> Images: fit to A4 page</label>
+          <button class="btn" id="combineBtn" disabled>Combine</button>
+        </div>
+      </div>
+      <p class="tip">Works fully offline. Drag to reorder.</p>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <script>
+    // New: supports per-page reordering of PDFs (when "Import PDFs as pages" is enabled)
+    // Data model
+    // state.items: ordered list of entries to output
+    //  - { kind: 'pdfpage', srcId, pageIndex, name, totalPages }
+    //  - { kind: 'pdfdoc',  srcId, name, totalPages }
+    //  - { kind: 'image',   name, mime, bytes }
+
+    const state = { items: [], sources: {} }; // sources[srcId] = { name, bytes, pageCount }
+
+    const el = (q)=>document.querySelector(q);
+    const list = el('#list');
+    const combineBtn = el('#combineBtn');
+    const clearBtn = el('#clearBtn');
+    const drop = el('#drop');
+    const picker = el('#picker');
+    const pickerBtn = el('#pickerBtn');
+    const bookmarkCh = el('#bookmarkCh');
+    const expandPdfCh = el('#expandPdfCh');
+
+    pickerBtn.addEventListener('click', ()=> picker.click());
+    picker.addEventListener('change', ev => addFiles(ev.target.files));
+
+    ['dragenter','dragover'].forEach(t=>drop.addEventListener(t, e=>{e.preventDefault(); drop.classList.add('drag');}));
+    ['dragleave','drop'].forEach(t=>drop.addEventListener(t, e=>{e.preventDefault(); drop.classList.remove('drag');}));
+    drop.addEventListener('drop', e=> addFiles(e.dataTransfer.files));
+    drop.addEventListener('click', ()=> picker.click());
+
+    function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+    async function addFiles(fileList){
+      const items = [...fileList];
+      for (const f of items){
+        const name = f.name;
+        const type = (f.type || '').toLowerCase();
+        if (type === 'application/pdf' || name.toLowerCase().endsWith('.pdf')){
+          const bytes = new Uint8Array(await f.arrayBuffer());
+          const srcId = uid();
+          // Peek page count
+          let pageCount = 1;
+          try {
+            const { PDFDocument } = window.PDFLib;
+            const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+            pageCount = doc.getPageCount();
+          } catch {}
+          state.sources[srcId] = { name, bytes, pageCount };
+          if (expandPdfCh.checked){
+            for (let i = 0; i < pageCount; i++){
+              state.items.push({ kind: 'pdfpage', srcId, pageIndex: i, name, totalPages: pageCount });
+            }
+          } else {
+            state.items.push({ kind: 'pdfdoc', srcId, name, totalPages: pageCount });
+          }
+        } else if (type === 'image/jpeg' || type === 'image/png' || /\.(jpe?g|png)$/i.test(name)){
+          const mime = type || (/.png$/i.test(name)?'image/png':'image/jpeg');
+          const bytes = new Uint8Array(await f.arrayBuffer());
+          state.items.push({ kind: 'image', name, mime, bytes });
+        }
+      }
+      render();
+    }
+
+    function render(){
+      list.innerHTML = '';
+      state.items.forEach((item, idx)=>{
+        const li = document.createElement('li');
+        li.className = 'row';
+        li.draggable = true;
+        let title = '';
+        if (item.kind === 'pdfpage') title = `📄 ${state.sources[item.srcId].name} — p${item.pageIndex+1}/${item.totalPages}`;
+        else if (item.kind === 'pdfdoc') title = `📄 ${item.name} — ${item.totalPages}p`;
+        else title = `🖼️ ${item.name}`;
+        li.innerHTML = `
+          <div class="name" title="${title}">${title}</div>
+          <div class="meta">${item.kind==='image' ? '' : ''}</div>
+          <div class="controls">
+            <button class="btn" data-act="up" data-idx="${idx}" title="Move up">↑</button>
+            <button class="btn" data-act="down" data-idx="${idx}" title="Move down">↓</button>
+            <button class="btn btn-danger" data-act="rm" data-idx="${idx}" title="Remove">✕</button>
+          </div>
+        `;
+        li.addEventListener('dragstart', ev=>ev.dataTransfer.setData('text/plain', idx.toString()));
+        li.addEventListener('dragover', ev=>ev.preventDefault());
+        li.addEventListener('drop', ev=>{
+          ev.preventDefault();
+          const from = +ev.dataTransfer.getData('text/plain');
+          move(from, idx);
+        });
+        list.appendChild(li);
+      });
+      list.onclick = (ev)=>{
+        const b = ev.target.closest('button'); if(!b) return;
+        const i = +b.dataset.idx; const act = b.dataset.act;
+        if (act==='up' && i>0) move(i, i-1);
+        if (act==='down' && i<state.items.length-1) move(i, i+1);
+        if (act==='rm') { state.items.splice(i,1); render(); }
+      };
+      combineBtn.disabled = state.items.length === 0;
+    }
+
+    function move(from,to){
+      const [x] = state.items.splice(from,1); state.items.splice(to,0,x); render();
+    }
+
+    async function combine(){
+      combineBtn.disabled = true; combineBtn.textContent = 'Combining…';
+      try{
+        const { PDFDocument } = window.PDFLib;
+        const outPdf = await PDFDocument.create();
+        const fitA4 = el('#fitA4Ch')?.checked;
+        const A4 = { w: 595.28, h: 841.89 }; // points
+        const loaded = {}; // cache of loaded source PDFs
+
+        for (const entry of state.items){
+          if (entry.kind === 'image'){
+            let img;
+            if (entry.mime.includes('png')) img = await outPdf.embedPng(entry.bytes);
+            else img = await outPdf.embedJpg(entry.bytes);
+
+            let w = img.width, h = img.height;
+            let pageW = w, pageH = h, drawW = w, drawH = h, x = 0, y = 0;
+            if (fitA4){
+              pageW = A4.w; pageH = A4.h;
+              const scale = Math.min(pageW / w, pageH / h);
+              drawW = w * scale; drawH = h * scale;
+              x = (pageW - drawW) / 2; y = (pageH - drawH) / 2;
+            }
+            const page = outPdf.addPage([pageW, pageH]);
+            page.drawImage(img, { x, y, width: drawW, height: drawH });
+            continue;
+          }
+
+          // PDF pages / whole docs
+          const src = state.sources[entry.srcId];
+          if (!loaded[entry.srcId]){
+            loaded[entry.srcId] = await PDFDocument.load(src.bytes, { ignoreEncryption: true });
+          }
+          const srcDoc = loaded[entry.srcId];
+
+          if (entry.kind === 'pdfpage'){
+            const [page] = await outPdf.copyPages(srcDoc, [entry.pageIndex]);
+            outPdf.addPage(page);
+          } else if (entry.kind === 'pdfdoc'){
+            const pages = await outPdf.copyPages(srcDoc, srcDoc.getPageIndices());
+            pages.forEach(p=> outPdf.addPage(p));
+          }
+        }
+
+        const mergedBytes = await outPdf.save({ updateFieldAppearances: false });
+        download(new Blob([mergedBytes], {type:'application/pdf'}), `combined_${Date.now()}.pdf`);
+      } catch (err){
+        alert('Failed to combine: ' + err.message);
+        console.error(err);
+      } finally {
+        combineBtn.textContent = 'Combine';
+        combineBtn.disabled = state.items.length === 0;
+      }
+    }
+
+    function download(blob, name){
+      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: name });
+      document.body.appendChild(a); a.click();
+      setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+
+    clearBtn.addEventListener('click', ()=>{ state.items = []; state.sources = {}; render(); });
+    combineBtn.addEventListener('click', combine);
+  </script>
+</body>
+</html>
